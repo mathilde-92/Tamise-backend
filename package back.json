@@ -1,0 +1,17 @@
+{
+  "name": "tamise-backend",
+  "version": "1.2.0",
+  "description": "Serveur de Tamisé : relais vers Infomaniak AI Services et partage de données entre deux téléphones (MySQL)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "cors": "^2.8.5",
+    "mysql2": "^3.11.0"
+  }
+}
