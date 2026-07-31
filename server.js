@@ -23,6 +23,9 @@ app.use(cors({ origin: "*" }));
 
 const INFOMANIAK_PRODUCT_ID = process.env.INFOMANIAK_PRODUCT_ID;
 const INFOMANIAK_API_KEY = process.env.INFOMANIAK_API_KEY;
+// Modèle utilisé. Défini ici (côté serveur) plutôt que dans l'application :
+// ça permet d'en changer sans avoir à reconstruire tout le site.
+const INFOMANIAK_MODEL = process.env.INFOMANIAK_MODEL;
 
 // Petite route de vérification, pour confirmer que le serveur tourne
 app.get("/", (req, res) => {
@@ -38,6 +41,11 @@ app.post("/api/ia", async (req, res) => {
   }
 
   try {
+    // Le modèle défini sur Render prime sur celui envoyé par l'application.
+    const corps = INFOMANIAK_MODEL
+      ? { ...req.body, model: INFOMANIAK_MODEL }
+      : req.body;
+
     const reponse = await fetch(
       `https://api.infomaniak.com/2/ai/${INFOMANIAK_PRODUCT_ID}/openai/v1/chat/completions`,
       {
@@ -46,7 +54,7 @@ app.post("/api/ia", async (req, res) => {
           Authorization: `Bearer ${INFOMANIAK_API_KEY}`,
           "Content-Type": "application/json",
         },
-        body: JSON.stringify(req.body),
+        body: JSON.stringify(corps),
       }
     );
 
