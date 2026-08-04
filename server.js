@@ -40,7 +40,35 @@ const INFOMANIAK_MODEL = process.env.INFOMANIAK_MODEL;
    ============================================================ */
 
 let pool = null;
-if (process.env.DATABASE_URL) {
+
+/**
+ * Crée la base de données si elle n'existe pas encore.
+ * Certains hébergeurs (dont Infomaniak) livrent un serveur MySQL vide, sans
+ * base à l'intérieur : on se connecte alors au serveur seul, on crée la base,
+ * puis on s'y connecte normalement.
+ */
+async function preparerBase() {
+  if (!process.env.DATABASE_URL) return;
+
+  const url = new URL(process.env.DATABASE_URL);
+  const nomBase = url.pathname.replace(/^\//, "") || "tamise";
+
+  // 1. Connexion au serveur seul (sans nom de base), pour pouvoir la créer.
+  const connexion = await mysql.createConnection({
+    host: url.hostname,
+    port: Number(url.port) || 3306,
+    user: decodeURIComponent(url.username),
+    password: decodeURIComponent(url.password),
+    ssl: { rejectUnauthorized: false },
+  });
+  await connexion.query(
+    "CREATE DATABASE IF NOT EXISTS `" + nomBase.replace(/`/g, "") + "` " +
+    "CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
+  );
+  await connexion.end();
+  console.log(`Base « ${nomBase} » prête.`);
+
+  // 2. Connexion normale, cette fois sur la base elle-même.
   pool = mysql.createPool({
     uri: process.env.DATABASE_URL,
     ssl: { rejectUnauthorized: false }, // les bases managées imposent une connexion TLS
@@ -50,6 +78,7 @@ if (process.env.DATABASE_URL) {
 }
 
 async function initBase() {
+  await preparerBase();
   if (!pool) {
     console.warn("DATABASE_URL absent : le partage entre téléphones est désactivé.");
     return;
