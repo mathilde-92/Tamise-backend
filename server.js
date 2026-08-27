@@ -27,7 +27,7 @@ app.use(express.json({ limit: "10mb" })); // marge pour les photos en base64
 // ⚠️ En production, remplace "*" par l'adresse exacte de ton site Netlify
 // (ex. "https://tamise.netlify.app") pour que seule ton app puisse
 // utiliser ce serveur.
-app.use(cors({ origin: "*" }));
+app.use(cors({ origin: "https://tamise.netlify.app" }));
 
 const INFOMANIAK_PRODUCT_ID = process.env.INFOMANIAK_PRODUCT_ID;
 const INFOMANIAK_API_KEY = process.env.INFOMANIAK_API_KEY;
