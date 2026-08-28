@@ -1,10 +1,12 @@
 /**
  * Serveur backend de Tamisé — à déployer sur Render.
  *
- * Deux rôles :
+ * Trois rôles :
  *  1. Garder la clé API Infomaniak en sécurité et relayer les demandes d'IA.
  *  2. Stocker les données partagées d'une relation (messages, agenda, dépenses…)
  *     pour que deux téléphones voient la même chose.
+ *  3. Extraire le texte des documents ajoutés (PDF) et retrouver, dans ce
+ *     texte, les passages qui répondent à une question posée à Iris.
  *
  * Base de données : MySQL (service managé Infomaniak, hébergé en Suisse).
  *
@@ -14,15 +16,21 @@
  *   INFOMANIAK_MODEL        le nom du modèle (ex. mistral24b)
  *   DATABASE_URL            adresse de la base MySQL, sous la forme
  *                           mysql://utilisateur:motdepasse@serveur:port/nom_base
+ *
+ * Dépendances à installer une fois dans ce dossier :
+ *   npm install pdf-parse
  */
 
 const express = require("express");
 const cors = require("cors");
 const crypto = require("crypto");
 const mysql = require("mysql2/promise");
+const pdfParse = require("pdf-parse");
 
 const app = express();
-app.use(express.json({ limit: "10mb" })); // marge pour les photos en base64
+// 25 Mo : un jugement de plusieurs centaines de pages, encodé en base64, pèse
+// bien plus que les 10 Mo qui suffisaient aux photos.
+app.use(express.json({ limit: "25mb" }));
 
 // Seules ces adresses peuvent utiliser ce serveur. Sans ça, n'importe quel
 // site pourrait consommer le crédit Infomaniak.
@@ -86,15 +94,25 @@ async function initBase() {
   // l'index est donc déclaré directement dans la table.
   await pool.query(`
     CREATE TABLE IF NOT EXISTS relations (
-      id       VARCHAR(36)  NOT NULL PRIMARY KEY,
-      code     VARCHAR(12)  NOT NULL UNIQUE,
-      type     VARCHAR(32)  NULL,
-      nom_a    VARCHAR(120) NULL,
-      nom_b    VARCHAR(120) NULL,
-      jumelee  TINYINT(1)   NOT NULL DEFAULT 0,
-      cree_le  TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP
+      id         VARCHAR(36)  NOT NULL PRIMARY KEY,
+      code       VARCHAR(12)  NOT NULL UNIQUE,
+      type       VARCHAR(32)  NULL,
+      nom_a      VARCHAR(120) NULL,
+      mon_nom_a  VARCHAR(120) NULL,
+      nom_b      VARCHAR(120) NULL,
+      jumelee    TINYINT(1)   NOT NULL DEFAULT 0,
+      cree_le    TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
   `);
+  // Migration sûre pour une base déjà existante (créée avant l'ajout de mon_nom_a) :
+  // nom_a est le nom que la personne A donne à SA relation (souvent le prénom de
+  // l'autre) — mon_nom_a est le vrai prénom de la personne A elle-même, nécessaire
+  // pour que la personne qui rejoint sache qui l'a invitée, et non son propre prénom.
+  try {
+    await pool.query("ALTER TABLE relations ADD COLUMN IF NOT EXISTS mon_nom_a VARCHAR(120) NULL");
+  } catch (e) {
+    console.warn("Migration mon_nom_a ignorée (déjà présente ou MySQL trop ancien) :", e.message);
+  }
   await pool.query(`
     CREATE TABLE IF NOT EXISTS elements (
       id           BIGINT      NOT NULL AUTO_INCREMENT PRIMARY KEY,
@@ -105,6 +123,21 @@ async function initBase() {
       cree_le      TIMESTAMP   NOT NULL DEFAULT CURRENT_TIMESTAMP,
       INDEX idx_elements_relation (relation_id, id),
       CONSTRAINT fk_elements_relation FOREIGN KEY (relation_id)
+        REFERENCES relations(id) ON DELETE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+  `);
+  // Texte extrait des documents ajoutés par les personnes.
+  // On ne garde QUE le texte : le fichier d'origine, lui, reste sur le téléphone.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS documents (
+      id           BIGINT       NOT NULL AUTO_INCREMENT PRIMARY KEY,
+      relation_id  VARCHAR(36)  NOT NULL,
+      doc_id       VARCHAR(64)  NOT NULL,
+      nom          VARCHAR(255) NULL,
+      texte        LONGTEXT     NULL,
+      cree_le      TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE KEY uniq_doc (relation_id, doc_id),
+      CONSTRAINT fk_documents_relation FOREIGN KEY (relation_id)
         REFERENCES relations(id) ON DELETE CASCADE
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
   `);
@@ -149,7 +182,7 @@ app.get("/", (req, res) => {
 app.post("/api/relations", async (req, res) => {
   if (!exigerBase(res)) return;
   try {
-    const { nom, type } = req.body || {};
+    const { nom, type, monNom } = req.body || {};
     const id = crypto.randomUUID();
 
     // On réessaie si le code tiré est déjà pris (très improbable).
@@ -162,8 +195,8 @@ app.post("/api/relations", async (req, res) => {
     if (!code) return res.status(500).json({ error: "Impossible de générer un code." });
 
     await pool.query(
-      "INSERT INTO relations (id, code, type, nom_a) VALUES (?, ?, ?, ?)",
-      [id, code, type || null, nom || null]
+      "INSERT INTO relations (id, code, type, nom_a, mon_nom_a) VALUES (?, ?, ?, ?, ?)",
+      [id, code, type || null, nom || null, monNom || null]
     );
     res.json({ relationId: id, code });
   } catch (e) {
@@ -180,7 +213,7 @@ app.post("/api/relations/rejoindre", async (req, res) => {
     if (!code) return res.status(400).json({ error: "Code manquant." });
 
     const [lignes] = await pool.query(
-      "SELECT id, type, nom_a, jumelee FROM relations WHERE code = ?",
+      "SELECT id, type, nom_a, mon_nom_a, jumelee FROM relations WHERE code = ?",
       [String(code).trim().toUpperCase()]
     );
     if (lignes.length === 0) return res.status(404).json({ error: "Code inconnu." });
@@ -194,7 +227,9 @@ app.post("/api/relations/rejoindre", async (req, res) => {
       "UPDATE relations SET jumelee = 1, nom_b = ? WHERE id = ?",
       [nom || null, rel.id]
     );
-    res.json({ relationId: rel.id, type: rel.type, nomAutre: rel.nom_a });
+    // mon_nom_a = le vrai prénom de la personne qui a invité. À défaut (bases
+    // créées avant cet ajout), on retombe sur nom_a pour ne rien casser.
+    res.json({ relationId: rel.id, type: rel.type, nomAutre: rel.mon_nom_a || rel.nom_a });
   } catch (e) {
     console.error("Erreur de jumelage :", e);
     res.status(500).json({ error: "Jumelage impossible." });
@@ -271,6 +306,133 @@ app.get("/api/relations/:id/elements", async (req, res) => {
   } catch (e) {
     console.error("Erreur lecture des éléments :", e);
     res.status(500).json({ error: "Lecture impossible." });
+  }
+});
+
+/* ============================================================
+   ROUTES — documents (extraction du texte et recherche)
+
+   Pourquoi ici et pas sur le téléphone : un jugement de divorce fait
+   couramment 200 pages. C'est trop lourd pour la mémoire d'un téléphone, et
+   bien trop long pour être envoyé d'un coup à l'IA. On extrait donc le texte
+   une seule fois, on le garde, et on ne renvoie que les passages qui
+   répondent à la question posée.
+   ============================================================ */
+
+/** Découpe un long texte en morceaux qui se chevauchent un peu, pour ne pas
+ *  couper en deux une phrase importante. */
+function decouperEnMorceaux(texte, taille = 1200, chevauchement = 200) {
+  const propre = (texte || "").replace(/\s+/g, " ").trim();
+  const morceaux = [];
+  if (!propre) return morceaux;
+  for (let i = 0; i < propre.length; i += taille - chevauchement) {
+    morceaux.push(propre.slice(i, i + taille));
+    if (i + taille >= propre.length) break;
+  }
+  return morceaux;
+}
+
+/** Mots trop courants pour être utiles : ils ressortiraient partout et
+ *  fausseraient complètement le classement des passages. */
+const MOTS_VIDES = new Set(["le", "la", "les", "un", "une", "des", "de", "du", "et", "ou", "que", "qui", "quoi", "est", "sont", "dans", "pour", "avec", "sur", "au", "aux", "ce", "cette", "ces", "mon", "ma", "mes", "ton", "ta", "tes", "son", "sa", "ses", "il", "elle", "je", "tu", "nous", "vous", "ils", "elles", "ne", "pas", "plus", "moins", "en", "par", "se", "si", "me", "te", "lui", "leur", "on", "dit", "fait", "peux", "peut", "dois", "doit", "avoir", "etre", "faire", "cela", "donc", "mais", "comme", "tout", "tous", "toute"]);
+
+/** Mots utiles d'une question, sans accents ni ponctuation. */
+function motsUtiles(question) {
+  return Array.from(new Set(
+    (question || "")
+      .toLowerCase()
+      .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+      .split(/[^a-z0-9]+/)
+      .filter((m) => m.length > 2 && !MOTS_VIDES.has(m))
+  ));
+}
+
+/** Reçoit un document, en extrait le texte, et le range. */
+app.post("/api/relations/:id/documents", async (req, res) => {
+  if (!exigerBase(res)) return;
+  try {
+    const { docId, nom, dataUrl } = req.body || {};
+    if (!docId || !dataUrl) {
+      return res.status(400).json({ error: "docId et dataUrl sont requis." });
+    }
+
+    // Le fichier arrive encodé en base64, précédé de son type.
+    const base64 = String(dataUrl).split(",").pop();
+    const binaire = Buffer.from(base64, "base64");
+
+    if (!String(dataUrl).startsWith("data:application/pdf")) {
+      // Photo d'un document : on ne sait pas encore y lire le texte.
+      return res.json({ ok: true, lisible: false, raison: "Seuls les PDF sont lus pour l'instant." });
+    }
+
+    const resultat = await pdfParse(binaire);
+    const texte = resultat.text || "";
+
+    if (!texte.trim()) {
+      return res.json({
+        ok: true,
+        lisible: false,
+        raison: "Ce PDF ne contient pas de texte : c'est probablement un scan ou une photo.",
+      });
+    }
+
+    await pool.query(
+      "INSERT INTO documents (relation_id, doc_id, nom, texte) VALUES (?, ?, ?, ?) " +
+      "ON DUPLICATE KEY UPDATE nom = VALUES(nom), texte = VALUES(texte)",
+      [req.params.id, docId, nom || null, texte]
+    );
+    res.json({ ok: true, lisible: true, caracteres: texte.length });
+  } catch (e) {
+    console.error("Erreur extraction document :", e);
+    res.status(500).json({ error: "Lecture du document impossible." });
+  }
+});
+
+/** Renvoie les passages des documents qui répondent le mieux à la question. */
+app.post("/api/relations/:id/documents/recherche", async (req, res) => {
+  if (!exigerBase(res)) return;
+  try {
+    const { question } = req.body || {};
+    const mots = motsUtiles(question);
+    if (mots.length === 0) return res.json({ extraits: [] });
+
+    const [docs] = await pool.query(
+      "SELECT doc_id, nom, texte FROM documents WHERE relation_id = ?",
+      [req.params.id]
+    );
+
+    const candidats = [];
+    for (const doc of docs) {
+      for (const morceau of decouperEnMorceaux(doc.texte)) {
+        const compare = morceau.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+        // Un passage vaut d'autant plus qu'il contient de mots DIFFÉRENTS de
+        // la question — pas seulement le même mot répété plusieurs fois.
+        let score = 0;
+        for (const mot of mots) if (compare.includes(mot)) score++;
+        if (score > 0) candidats.push({ nom: doc.nom || "Document", texte: morceau, score });
+      }
+    }
+
+    candidats.sort((a, b) => b.score - a.score);
+    res.json({ extraits: candidats.slice(0, 4).map(({ nom, texte }) => ({ nom, texte })) });
+  } catch (e) {
+    console.error("Erreur recherche documents :", e);
+    res.status(500).json({ error: "Recherche impossible." });
+  }
+});
+
+/** Supprime le texte d'un document (quand il est retiré de l'application). */
+app.delete("/api/relations/:id/documents/:docId", async (req, res) => {
+  if (!exigerBase(res)) return;
+  try {
+    await pool.query(
+      "DELETE FROM documents WHERE relation_id = ? AND doc_id = ?",
+      [req.params.id, req.params.docId]
+    );
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("Erreur suppression document :", e);
+    res.status(500).json({ error: "Suppression impossible." });
   }
 });
 
