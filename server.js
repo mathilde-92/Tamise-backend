@@ -26,15 +26,17 @@ const cors = require("cors");
 const crypto = require("crypto");
 const mysql = require("mysql2/promise");
 const pdfParse = require("pdf-parse");
+const { TEXTES_LOI } = require("./textes-loi");
 
 const app = express();
 // 25 Mo : un jugement de plusieurs centaines de pages, encodé en base64, pèse
 // bien plus que les 10 Mo qui suffisaient aux photos.
 app.use(express.json({ limit: "25mb" }));
 
-// Seules ces adresses peuvent utiliser ce serveur. Sans ça, n'importe quel
-// site pourrait consommer le crédit Infomaniak.
-app.use(cors({ origin: ["https://tamise.netlify.app"] }));
+// ⚠️ En production, remplace "*" par l'adresse exacte de ton site Netlify
+// (ex. "https://tamise.netlify.app") pour que seule ton app puisse
+// utiliser ce serveur.
+app.use(cors({ origin: "*" }));
 
 const INFOMANIAK_PRODUCT_ID = process.env.INFOMANIAK_PRODUCT_ID;
 const INFOMANIAK_API_KEY = process.env.INFOMANIAK_API_KEY;
@@ -433,6 +435,51 @@ app.delete("/api/relations/:id/documents/:docId", async (req, res) => {
   } catch (e) {
     console.error("Erreur suppression document :", e);
     res.status(500).json({ error: "Suppression impossible." });
+  }
+});
+
+/* ============================================================
+   ROUTE — textes de loi de référence
+
+   Iris n'a pas internet : sans ces textes, elle répondrait de mémoire et
+   inventerait des numéros d'article. Elle ne peut citer que ce qui est écrit
+   dans textes-loi.js. Les entrées non remplies sont ignorées.
+   ============================================================ */
+
+/** Textes réellement disponibles (ceux dont le contenu a été copié). */
+const TEXTES_REMPLIS = (TEXTES_LOI || []).filter((t) => t && t.texte && t.texte.trim().length > 30);
+console.log(`Textes de loi disponibles : ${TEXTES_REMPLIS.length} / ${(TEXTES_LOI || []).length}`);
+
+app.post("/api/textes-loi/recherche", (req, res) => {
+  try {
+    const { question } = req.body || {};
+    const mots = motsUtiles(question);
+    if (mots.length === 0 || TEXTES_REMPLIS.length === 0) return res.json({ extraits: [] });
+
+    const candidats = [];
+    for (const t of TEXTES_REMPLIS) {
+      // On cherche dans le titre ET dans le texte : le titre porte souvent le
+      // mot que la personne emploie (« pension », « déménagement »).
+      // Les mots-clés et le titre pèsent plus lourd que le corps de l'article :
+      // ils sont écrits avec les mots que les gens emploient réellement, alors
+      // que le texte de loi a un vocabulaire que personne n'utilise pour poser
+      // sa question (« contribution à l'entretien » plutôt que « pension »).
+      const cles = ((t.motsCles || "") + " " + t.titre + " " + t.domaine)
+        .toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+      const corps = (t.texte || "")
+        .toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+      let score = 0;
+      for (const mot of mots) {
+        if (cles.includes(mot)) score += 3;
+        else if (corps.includes(mot)) score += 1;
+      }
+      if (score > 0) candidats.push({ source: t.source, titre: t.titre, texte: t.texte, score });
+    }
+    candidats.sort((a, b) => b.score - a.score);
+    res.json({ extraits: candidats.slice(0, 3).map(({ source, titre, texte }) => ({ source, titre, texte })) });
+  } catch (e) {
+    console.error("Erreur recherche textes de loi :", e);
+    res.status(500).json({ error: "Recherche impossible." });
   }
 });
 
