@@ -33,10 +33,9 @@ const app = express();
 // bien plus que les 10 Mo qui suffisaient aux photos.
 app.use(express.json({ limit: "25mb" }));
 
-// ⚠️ En production, remplace "*" par l'adresse exacte de ton site Netlify
-// (ex. "https://tamise.netlify.app") pour que seule ton app puisse
-// utiliser ce serveur.
-app.use(cors({ origin: "*" }));
+// Seules ces adresses peuvent utiliser ce serveur. Sans ça, n'importe quel
+// site pourrait consommer le crédit Infomaniak.
+app.use(cors({ origin: ["https://tamise.netlify.app"] }));
 
 const INFOMANIAK_PRODUCT_ID = process.env.INFOMANIAK_PRODUCT_ID;
 const INFOMANIAK_API_KEY = process.env.INFOMANIAK_API_KEY;
