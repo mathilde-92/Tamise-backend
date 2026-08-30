@@ -33,9 +33,10 @@ const app = express();
 // bien plus que les 10 Mo qui suffisaient aux photos.
 app.use(express.json({ limit: "25mb" }));
 
-// Seules ces adresses peuvent utiliser ce serveur. Sans ça, n'importe quel
-// site pourrait consommer le crédit Infomaniak.
-app.use(cors({ origin: ["https://tamise.netlify.app"] }));
+// ⚠️ En production, remplace "*" par l'adresse exacte de ton site Netlify
+// (ex. "https://tamise.netlify.app") pour que seule ton app puisse
+// utiliser ce serveur.
+app.use(cors({ origin: "*" }));
 
 const INFOMANIAK_PRODUCT_ID = process.env.INFOMANIAK_PRODUCT_ID;
 const INFOMANIAK_API_KEY = process.env.INFOMANIAK_API_KEY;
@@ -109,10 +110,23 @@ async function initBase() {
   // nom_a est le nom que la personne A donne à SA relation (souvent le prénom de
   // l'autre) — mon_nom_a est le vrai prénom de la personne A elle-même, nécessaire
   // pour que la personne qui rejoint sache qui l'a invitée, et non son propre prénom.
+  //
+  // On ne se fie PAS à « ADD COLUMN IF NOT EXISTS » : cette syntaxe n'est pas
+  // reconnue par toutes les versions de MySQL, et quand elle échoue le serveur
+  // continue sans la colonne — puis chaque création de relation plante avec
+  // « Unknown column 'mon_nom_a' ». On vérifie donc d'abord si la colonne existe,
+  // et on l'ajoute seulement si besoin.
   try {
-    await pool.query("ALTER TABLE relations ADD COLUMN IF NOT EXISTS mon_nom_a VARCHAR(120) NULL");
+    const [colonnes] = await pool.query(
+      "SELECT COLUMN_NAME FROM information_schema.COLUMNS " +
+      "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'relations' AND COLUMN_NAME = 'mon_nom_a'"
+    );
+    if (colonnes.length === 0) {
+      await pool.query("ALTER TABLE relations ADD COLUMN mon_nom_a VARCHAR(120) NULL");
+      console.log("Colonne mon_nom_a ajoutée à la table relations.");
+    }
   } catch (e) {
-    console.warn("Migration mon_nom_a ignorée (déjà présente ou MySQL trop ancien) :", e.message);
+    console.error("Migration mon_nom_a : échec —", e.message);
   }
   await pool.query(`
     CREATE TABLE IF NOT EXISTS elements (
