@@ -12,11 +12,6 @@
  * de l'enfant » (articles 371 à 381-2), extrait de Légifrance dans sa version
  * en vigueur au 21 février 2024.
  *
- * ⚠️ ATTENTION AUX DATES
- * Trois articles de cet extrait portent la mention « en vigueur jusqu'au
- * 20 mars 2024 » : une version plus récente existe donc, et l'extrait ne la
- * contient pas. Ils sont signalés dans leur champ « verifieLe ».
- *
  * COMMENT COMPLÉTER
  * Les entrées dont le champ « texte » est vide sont ignorées par le serveur :
  * rien ne casse tant qu'elles ne sont pas remplies. Pour chacune, va sur
@@ -140,7 +135,7 @@ const TEXTES_LOI = [
     domaine: "Pension et frais",
     source: "Article 371-2 du code civil",
     titre: "Obligation d'entretien, proportionnelle aux ressources de chacun",
-    motsCles: "contribution entretien education proportion ressources besoins enfant majeur obligation argent payer participer partager depenses",
+    motsCles: "pension alimentaire contribution entretien education proportion ressources besoins enfant majeur obligation obligatoire oblige loi article payer verser participer partager depenses pere mere chacun",
     verifieLe: "En vigueur depuis le 30 décembre 2019",
     texte: "Chacun des parents contribue à l'entretien et à l'éducation des enfants à proportion de ses ressources, de celles de l'autre parent, ainsi que des besoins de l'enfant.\n\nCette obligation ne cesse de plein droit ni lorsque l'autorité parentale ou son exercice est retiré, ni lorsque l'enfant est majeur.",
   },
