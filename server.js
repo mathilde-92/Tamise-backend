@@ -37,6 +37,11 @@ app.use(express.json({ limit: "25mb" }));
 // site pourrait consommer le crédit Infomaniak.
 app.use(cors({ origin: ["https://tamise.netlify.app"] }));
 
+// Exception : l'agenda auquel on s'abonne est lu par Google, Apple ou Outlook,
+// pas par le site. Il doit donc rester accessible à eux aussi. L'adresse
+// contient un identifiant tiré au hasard : c'est elle qui protège l'accès.
+app.get("/api/agenda/:relationId.ics", cors({ origin: "*" }), (req, res, next) => next());
+
 const INFOMANIAK_PRODUCT_ID = process.env.INFOMANIAK_PRODUCT_ID;
 const INFOMANIAK_API_KEY = process.env.INFOMANIAK_API_KEY;
 // Modèle utilisé. Défini ici (côté serveur) plutôt que dans l'application :
@@ -447,6 +452,91 @@ app.delete("/api/relations/:id/documents/:docId", async (req, res) => {
   } catch (e) {
     console.error("Erreur suppression document :", e);
     res.status(500).json({ error: "Suppression impossible." });
+  }
+});
+
+/* ============================================================
+   ROUTE — agenda auquel on s'abonne (.ics)
+
+   Google Agenda, l'app Calendrier d'iPhone et Outlook savent tous s'abonner à
+   une adresse qui renvoie un calendrier, et la relisent régulièrement d'eux-
+   mêmes. Un événement confirmé dans Tamisé apparaît donc chez les deux
+   personnes sans que personne n'ait rien à réimporter.
+
+   L'adresse contient l'identifiant de la relation, tiré au hasard et donc
+   impossible à deviner. Elle reste néanmoins SECRÈTE : qui l'obtient peut lire
+   l'agenda. C'est le fonctionnement normal des agendas partagés, mais il faut
+   le dire clairement aux personnes.
+
+   Seuls les événements CONFIRMÉS sortent d'ici : ce qui attend encore l'accord
+   de l'autre ne part pas dans son calendrier.
+   ============================================================ */
+
+function echapperICS(txt) {
+  return String(txt || "").replace(/\\/g, "\\\\").replace(/;/g, "\\;").replace(/,/g, "\\,").replace(/\r?\n/g, "\\n");
+}
+
+function dateICS(iso, jourEntier) {
+  const propre = String(iso || "").replace(/[-:]/g, "");
+  if (jourEntier) return propre.slice(0, 8);
+  const [d, h] = propre.split("T");
+  return d + "T" + (h || "0900").padEnd(6, "0");
+}
+
+app.get("/api/agenda/:relationId.ics", async (req, res) => {
+  if (!exigerBase(res)) return;
+  try {
+    const [lignes] = await pool.query(
+      "SELECT type, contenu FROM elements WHERE relation_id = ? ORDER BY id ASC",
+      [req.params.relationId]
+    );
+
+    // On rejoue l'historique : les ajouts d'événements, puis les modifications
+    // (confirmation, changement d'horaire…) dans l'ordre où elles ont eu lieu.
+    const parId = new Map();
+    for (const l of lignes) {
+      const c = typeof l.contenu === "string" ? JSON.parse(l.contenu) : l.contenu;
+      if (!c) continue;
+      if (l.type === "agenda" && c.id) parId.set(c.id, { ...c });
+      if (l.type === "maj" && c.champ === "agenda" && c.id) {
+        if (c.supprimerElement) { parId.delete(c.id); continue; }
+        const actuel = parId.get(c.id);
+        if (actuel) parId.set(c.id, { ...actuel, ...(c.patch || c.patchElement || {}) });
+      }
+    }
+
+    const evenements = [...parId.values()].filter((e) => e && e.start && e.statut === "confirme");
+
+    const ics = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Tamise//FR", "CALSCALE:GREGORIAN",
+      "METHOD:PUBLISH", "X-WR-CALNAME:Tamisé", "X-PUBLISHED-TTL:PT1H",
+      "REFRESH-INTERVAL;VALUE=DURATION:PT1H"];
+    for (const e of evenements) {
+      const jourEntier = !!e.allDay;
+      ics.push("BEGIN:VEVENT");
+      ics.push("UID:" + e.id + "@tamise");
+      ics.push("DTSTAMP:" + dateICS(new Date().toISOString().slice(0, 16), false) + "Z");
+      if (jourEntier) {
+        ics.push("DTSTART;VALUE=DATE:" + dateICS(e.start, true));
+        ics.push("DTEND;VALUE=DATE:" + dateICS(e.end || e.start, true));
+      } else {
+        ics.push("DTSTART:" + dateICS(e.start, false));
+        ics.push("DTEND:" + dateICS(e.end || e.start, false));
+      }
+      ics.push("SUMMARY:" + echapperICS(e.titre));
+      if (e.cat) ics.push("CATEGORIES:" + echapperICS(e.cat));
+      if (e.recurrence === "semaine") ics.push("RRULE:FREQ=WEEKLY");
+      if (e.recurrence === "quinzaine") ics.push("RRULE:FREQ=WEEKLY;INTERVAL=2");
+      if (e.recurrence === "mois") ics.push("RRULE:FREQ=MONTHLY");
+      ics.push("END:VEVENT");
+    }
+    ics.push("END:VCALENDAR");
+
+    res.set("Content-Type", "text/calendar; charset=utf-8");
+    res.set("Cache-Control", "no-cache");
+    res.send(ics.join("\r\n"));
+  } catch (e) {
+    console.error("Erreur agenda .ics :", e);
+    res.status(500).send("Agenda indisponible.");
   }
 });
 
