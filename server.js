@@ -455,6 +455,21 @@ app.delete("/api/relations/:id/documents/:docId", async (req, res) => {
   }
 });
 
+/** Efface une relation et TOUT ce qu'elle contient.
+ *  Les messages, l'agenda, les dépenses et les documents partent avec elle :
+ *  les clés étrangères sont déclarées ON DELETE CASCADE. C'est le droit à
+ *  l'effacement du RGPD — il faut qu'il ne reste vraiment rien. */
+app.delete("/api/relations/:id", async (req, res) => {
+  if (!exigerBase(res)) return;
+  try {
+    await pool.query("DELETE FROM relations WHERE id = ?", [req.params.id]);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("Erreur suppression de relation :", e);
+    res.status(500).json({ error: "Suppression impossible." });
+  }
+});
+
 /* ============================================================
    ROUTE — agenda auquel on s'abonne (.ics)
 
