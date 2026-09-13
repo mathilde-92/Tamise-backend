@@ -145,6 +145,23 @@ async function initBase() {
         REFERENCES relations(id) ON DELETE CASCADE
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
   `);
+  // Qui a quitté la relation. Tant qu'une seule des deux personnes est partie,
+  // on garde tout : l'autre a le droit de conserver ses échanges et surtout les
+  // preuves qu'elle a archivées. Effacer sur simple demande de l'un reviendrait
+  // à laisser n'importe qui supprimer les traces de ce qu'il a écrit.
+  try {
+    const [col] = await pool.query(
+      "SELECT COLUMN_NAME FROM information_schema.COLUMNS " +
+      "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'relations' AND COLUMN_NAME = 'quittee_par'"
+    );
+    if (col.length === 0) {
+      await pool.query("ALTER TABLE relations ADD COLUMN quittee_par TEXT NULL");
+      console.log("Colonne quittee_par ajoutée à la table relations.");
+    }
+  } catch (e) {
+    console.error("Migration quittee_par : échec —", e.message);
+  }
+
   // Texte extrait des documents ajoutés par les personnes.
   // On ne garde QUE le texte : le fichier d'origine, lui, reste sur le téléphone.
   await pool.query(`
@@ -462,11 +479,32 @@ app.delete("/api/relations/:id/documents/:docId", async (req, res) => {
 app.delete("/api/relations/:id", async (req, res) => {
   if (!exigerBase(res)) return;
   try {
-    await pool.query("DELETE FROM relations WHERE id = ?", [req.params.id]);
-    res.json({ ok: true });
+    const appareil = String((req.query && req.query.appareil) || "").slice(0, 64);
+
+    const [lignes] = await pool.query(
+      "SELECT jumelee, quittee_par FROM relations WHERE id = ?",
+      [req.params.id]
+    );
+    if (lignes.length === 0) return res.json({ ok: true, efface: true });
+
+    const rel = lignes[0];
+    let partis = [];
+    try { partis = JSON.parse(rel.quittee_par || "[]"); } catch (e) { partis = []; }
+    if (appareil && !partis.includes(appareil)) partis.push(appareil);
+
+    // Jamais reliée à un second téléphone, ou les deux personnes sont parties :
+    // plus personne n'en a l'usage, on efface tout (cascade sur les éléments
+    // et les documents).
+    if (!rel.jumelee || partis.length >= 2 || !appareil) {
+      await pool.query("DELETE FROM relations WHERE id = ?", [req.params.id]);
+      return res.json({ ok: true, efface: true });
+    }
+
+    await pool.query("UPDATE relations SET quittee_par = ? WHERE id = ?", [JSON.stringify(partis), req.params.id]);
+    res.json({ ok: true, efface: false });
   } catch (e) {
-    console.error("Erreur suppression de relation :", e);
-    res.status(500).json({ error: "Suppression impossible." });
+    console.error("Erreur en quittant la relation :", e);
+    res.status(500).json({ error: "Opération impossible." });
   }
 });
 
