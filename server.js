@@ -178,6 +178,22 @@ async function initBase() {
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
   `);
   console.log("Base de données prête.");
+
+  // Purge des codes jamais utilisés après 7 jours : sans ce nettoyage, un
+  // code oublié resterait jumelable indéfiniment, même bien après que la
+  // personne qui l'a envoyé n'y pense plus.
+  async function purgerCodesExpires() {
+    try {
+      const [r] = await pool.query(
+        "DELETE FROM relations WHERE jumelee = 0 AND cree_le < (NOW() - INTERVAL 7 DAY)"
+      );
+      if (r.affectedRows) console.log(`${r.affectedRows} code(s) de jumelage expiré(s) purgé(s).`);
+    } catch (e) {
+      console.error("Purge des codes expirés : échec —", e.message);
+    }
+  }
+  purgerCodesExpires();
+  setInterval(purgerCodesExpires, 6 * 60 * 60 * 1000); // toutes les 6 heures
 }
 
 /** Code de jumelage court, sans caractères ambigus (ni O/0, ni I/1). */
@@ -249,7 +265,7 @@ app.post("/api/relations/rejoindre", async (req, res) => {
     if (!code) return res.status(400).json({ error: "Code manquant." });
 
     const [lignes] = await pool.query(
-      "SELECT id, type, nom_a, mon_nom_a, jumelee FROM relations WHERE code = ?",
+      "SELECT id, type, nom_a, mon_nom_a, jumelee, cree_le FROM relations WHERE code = ?",
       [String(code).trim().toUpperCase()]
     );
     if (lignes.length === 0) return res.status(404).json({ error: "Code inconnu." });
@@ -257,6 +273,17 @@ app.post("/api/relations/rejoindre", async (req, res) => {
     const rel = lignes[0];
     if (rel.jumelee) {
       return res.status(409).json({ error: "Cette relation est déjà reliée à un autre téléphone." });
+    }
+
+    // Un code non utilisé n'a pas vocation à rester valable indéfiniment : ce
+    // serait un code qui traîne, potentiellement intercepté ou envoyé par
+    // erreur, et toujours jumelable des mois plus tard sans que personne s'en
+    // souvienne. Passé 7 jours sans avoir été utilisé, on l'efface plutôt que
+    // de le laisser orphelin en base, et on le dit clairement.
+    const ageJours = (Date.now() - new Date(rel.cree_le).getTime()) / 86400000;
+    if (ageJours > 7) {
+      await pool.query("DELETE FROM relations WHERE id = ?", [rel.id]);
+      return res.status(410).json({ error: "Ce code a expiré (plus de 7 jours). Demande-en un nouveau." });
     }
 
     await pool.query(
