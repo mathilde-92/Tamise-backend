@@ -13,7 +13,9 @@
  * Variables d'environnement attendues sur Render :
  *   INFOMANIAK_PRODUCT_ID   ton identifiant produit AI Services
  *   INFOMANIAK_API_KEY      ton token API Infomaniak
- *   INFOMANIAK_MODEL        le nom du modèle (ex. mistral24b)
+ *   INFOMANIAK_MODEL        le nom EXACT du modèle, copié depuis la page
+ *                           /api/modeles de ce serveur
+ *                           (ex. Qwen/Qwen3.5-122B-A10B-FP8)
  *   DATABASE_URL            adresse de la base MySQL, sous la forme
  *                           mysql://utilisateur:motdepasse@serveur:port/nom_base
  *
@@ -46,7 +48,248 @@ const INFOMANIAK_PRODUCT_ID = process.env.INFOMANIAK_PRODUCT_ID;
 const INFOMANIAK_API_KEY = process.env.INFOMANIAK_API_KEY;
 // Modèle utilisé. Défini ici (côté serveur) plutôt que dans l'application :
 // ça permet d'en changer sans avoir à reconstruire tout le site.
-const INFOMANIAK_MODEL = process.env.INFOMANIAK_MODEL;
+// Nettoyé des espaces et guillemets qu'un copier-coller ajoute facilement.
+const INFOMANIAK_MODEL = (process.env.INFOMANIAK_MODEL || "").trim().replace(/^["'`«\s]+|["'`»\s]+$/g, "");
+// Adresse d'Infomaniak. Modifiable uniquement pour les tests.
+const INFOMANIAK_BASE = process.env.INFOMANIAK_BASE_URL || "https://api.infomaniak.com";
+
+/* ------------------------------------------------------------
+   Choix du modèle
+
+   Infomaniak renouvelle ses modèles : un modèle retiré reste utilisable
+   30 jours, puis disparaît. Et un nom mal recopié (une majuscule, un espace)
+   suffit à tout bloquer. Au démarrage, le serveur lit donc la liste exacte
+   des modèles disponibles, retrouve celui qui est demandé même mal écrit, et
+   s'il n'existe pas, en prend un de secours plutôt que de laisser l'app sans
+   filtre. Tout est écrit dans les logs de Render.
+   ------------------------------------------------------------ */
+
+// Du meilleur au moins bon pour Tamisé. Sert seulement si le modèle demandé
+// n'existe pas (ou plus).
+const MODELES_DE_SECOURS = [
+  "Qwen/Qwen3.5-122B-A10B-FP8",
+  "mistralai/Mistral-Small-4-119B-2603",
+  "mistral24b",
+];
+
+let modelesDisponibles = null;            // liste lue chez Infomaniak
+let modeleEffectif = INFOMANIAK_MODEL || null;
+
+async function lireModelesInfomaniak() {
+  const r = await fetch(`${INFOMANIAK_BASE}/2/ai/${INFOMANIAK_PRODUCT_ID}/openai/v1/models`, {
+    headers: { Authorization: `Bearer ${INFOMANIAK_API_KEY}` },
+  });
+  const d = await r.json().catch(() => null);
+  if (!r.ok || !d) throw new Error("HTTP " + r.status + " " + JSON.stringify(d).slice(0, 300));
+  const liste = Array.isArray(d.data) ? d.data : Array.isArray(d.models) ? d.models : Array.isArray(d) ? d : [];
+  return liste.map((m) => (typeof m === "string" ? m : m && (m.id || m.name || m.model))).filter(Boolean);
+}
+
+/** Retrouve un modèle même écrit avec d'autres majuscules ou des espaces. */
+function trouverModele(nom, liste) {
+  if (!nom || !liste) return null;
+  if (liste.includes(nom)) return nom;
+  const simple = (s) => String(s).toLowerCase().replace(/\s+/g, "");
+  return liste.find((m) => simple(m) === simple(nom)) || null;
+}
+
+async function choisirModele() {
+  if (!INFOMANIAK_PRODUCT_ID || !INFOMANIAK_API_KEY) return;
+  try {
+    modelesDisponibles = await lireModelesInfomaniak();
+  } catch (e) {
+    console.error("Liste des modèles Infomaniak illisible :", e.message);
+    return; // on garde le nom demandé tel quel
+  }
+  console.log("Modèles disponibles chez Infomaniak :", modelesDisponibles.join("  |  "));
+
+  const trouve = trouverModele(INFOMANIAK_MODEL, modelesDisponibles);
+  if (trouve) {
+    if (trouve !== INFOMANIAK_MODEL) {
+      console.log(`Modèle « ${INFOMANIAK_MODEL} » reconnu sous son nom exact « ${trouve} ».`);
+    }
+    modeleEffectif = trouve;
+  } else {
+    if (INFOMANIAK_MODEL) {
+      console.error(
+        `ATTENTION : le modèle « ${INFOMANIAK_MODEL} » (variable INFOMANIAK_MODEL sur Render) ` +
+        "n'existe pas chez Infomaniak. Copie un nom exact depuis la page /api/modeles."
+      );
+    }
+    const secours = MODELES_DE_SECOURS.map((m) => trouverModele(m, modelesDisponibles)).find(Boolean);
+    if (secours) {
+      modeleEffectif = secours;
+      console.error("En attendant, modèle de secours utilisé :", secours);
+    }
+  }
+  console.log("Modèle utilisé :", modeleEffectif || "(aucun)");
+}
+
+/** Réglages propres à certains modèles. */
+function reglagesPourModele(modele) {
+  const m = String(modele || "").toLowerCase();
+  // Qwen « réfléchit à voix haute » par défaut avant de répondre : c'est plus
+  // lent, plus cher, et la vraie réponse peut arriver coupée. On le désactive.
+  if (m.includes("qwen")) return { chat_template_kwargs: { enable_thinking: false } };
+  if (m.includes("mistral-small-4")) return { reasoning_effort: "none" };
+  return {};
+}
+
+// Modèles capables de réfléchir avant de répondre. Si le réglage ci-dessus
+// n'est pas pris en compte, on leur laisse de la marge pour que la réponse
+// ne soit pas coupée. La marge ne coûte rien si elle ne sert pas.
+const PEUT_REFLECHIR = /qwen|mistral-small-4|magistral|gpt-oss|kimi|deepseek|reason/i;
+
+function estJSON(texte) {
+  try { JSON.parse(texte); return true; } catch (e) { return false; }
+}
+
+let reflexionSignalee = false;
+const reglagesRefuses = new Set();       // modèles pour lesquels Infomaniak refuse nos réglages
+
+/** Rend une réponse propre à l'app : sans réflexion à voix haute et, quand
+ *  l'app a demandé du JSON, avec le JSON seul — un mot de trop avant ou après
+ *  suffisait à faire échouer la lecture, et l'app retombait alors sur son
+ *  filtre de secours. */
+function nettoyerReponse(donnees, demandeJSON, modele) {
+  const choix = donnees && Array.isArray(donnees.choices) ? donnees.choices[0] : null;
+  if (!choix || !choix.message) return;
+  let texte = typeof choix.message.content === "string" ? choix.message.content : "";
+  let reflechi = Boolean(choix.message.reasoning_content || choix.message.reasoning);
+
+  for (const [ouvre, ferme] of [["<think>", "</think>"], ["[THINK]", "[/THINK]"]]) {
+    const bas = texte.toLowerCase();
+    if (!bas.includes(ouvre.toLowerCase()) && !bas.includes(ferme.toLowerCase())) continue;
+    reflechi = true;
+    const fin = bas.lastIndexOf(ferme.toLowerCase());
+    if (fin !== -1) {
+      texte = texte.slice(fin + ferme.length);                              // tout ce qui suit la réflexion
+    } else {
+      texte = texte.slice(0, bas.indexOf(ouvre.toLowerCase()));             // réflexion jamais refermée
+    }
+  }
+  texte = texte.trim();
+
+  if (demandeJSON) {
+    const sansBalises = texte.replace(/```(?:json)?/gi, "").trim();
+    if (estJSON(sansBalises)) {
+      texte = sansBalises;
+    } else {
+      const debut = sansBalises.indexOf("{");
+      const fin = sansBalises.lastIndexOf("}");
+      if (debut !== -1 && fin > debut && estJSON(sansBalises.slice(debut, fin + 1))) {
+        texte = sansBalises.slice(debut, fin + 1);
+      }
+    }
+  }
+
+  choix.message.content = texte;
+  delete choix.message.reasoning_content; // inutile au téléphone, et lourd
+  delete choix.message.reasoning;
+  if (reflechi && !reflexionSignalee) {
+    reflexionSignalee = true;
+    console.warn(`Le modèle ${modele} réfléchit avant de répondre malgré le réglage : réponses plus lentes et plus chères.`);
+  }
+}
+
+async function appelInfomaniak(corps) {
+  const r = await fetch(`${INFOMANIAK_BASE}/2/ai/${INFOMANIAK_PRODUCT_ID}/openai/v1/chat/completions`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${INFOMANIAK_API_KEY}`, "Content-Type": "application/json" },
+    body: JSON.stringify(corps),
+  });
+  const donnees = await r.json().catch(() => ({ error: "Réponse illisible d'Infomaniak (HTTP " + r.status + ")" }));
+  return { ok: r.ok, status: r.status, donnees };
+}
+
+function modeleInconnu(rep) {
+  if (rep.status === 404) return true;
+  const t = JSON.stringify(rep.donnees || "").toLowerCase();
+  return t.includes("model") && /not found|unknown|invalid|does not exist|not exist|not available|introuvable|inconnu/.test(t);
+}
+
+/** Envoie une demande à l'IA avec le bon modèle et ses réglages.
+ *  - Si Infomaniak refuse un réglage qu'il ne connaît pas, réessaie sans, et
+ *    ne le renvoie plus jamais pour ce modèle.
+ *  - Si le modèle est inconnu (mal écrit, ou retiré entre-temps), relit la
+ *    liste et réessaie une fois avec le bon nom ou un modèle de secours. */
+async function demanderIA(demande) {
+  const essayer = async (nom) => {
+    const reglages = reglagesRefuses.has(nom) ? {} : reglagesPourModele(nom);
+    let corps = { ...demande, model: nom, ...reglages };
+    if (PEUT_REFLECHIR.test(nom) && corps.max_tokens) corps.max_tokens = corps.max_tokens + 1500;
+    let rep = await appelInfomaniak(corps);
+    if (!rep.ok && Object.keys(reglages).length && (rep.status === 400 || rep.status === 422)) {
+      const sans = { ...corps };
+      Object.keys(reglages).forEach((k) => delete sans[k]);
+      const rep2 = await appelInfomaniak(sans);
+      if (rep2.ok) {
+        reglagesRefuses.add(nom);
+        console.error(`Infomaniak refuse le réglage ${Object.keys(reglages).join(", ")} pour ${nom} : envoyé sans désormais.`, JSON.stringify(rep.donnees).slice(0, 300));
+      }
+      rep = rep2;
+      corps = sans;
+    }
+    return { rep, corps };
+  };
+
+  const modele = modeleEffectif || demande.model;
+  let { rep, corps } = await essayer(modele);
+  if (!rep.ok && modeleInconnu(rep)) {
+    console.error(`Modèle « ${modele} » refusé par Infomaniak :`, JSON.stringify(rep.donnees).slice(0, 400));
+    await choisirModele();
+    if (modeleEffectif && modeleEffectif !== modele) {
+      ({ rep, corps } = await essayer(modeleEffectif));
+    }
+  }
+  return { rep, corps };
+}
+
+/** Traduit un refus d'Infomaniak en une phrase simple. */
+function expliquerErreur(status, detail) {
+  const t = String(detail || "").toLowerCase();
+  if (/cr[eé]dit\b|cr[eé]dits|payment|paiement|billing|factur|balance|solde|insufficient (funds|credit|balance)/.test(t) || status === 402) {
+    return "Infomaniak parle de paiement ou de crédit : ton crédit est sans doute épuisé, ou un paiement est en attente.";
+  }
+  if (status === 401 || status === 403) {
+    return "Infomaniak refuse la clé : vérifie que INFOMANIAK_API_KEY sur Render est recopiée en entier, toujours valide, et qu'elle a le droit d'utiliser l'IA.";
+  }
+  if (status === 404) return "Infomaniak ne trouve pas le modèle ou le produit : vérifie INFOMANIAK_MODEL et INFOMANIAK_PRODUCT_ID.";
+  if (status === 429 || /quota|spending|plafond|limit (reached|exceeded)/.test(t)) {
+    return "Une limite est atteinte (trop de demandes d'un coup, ou plafond de dépenses). Réessaie dans une minute.";
+  }
+  if (status >= 500) return "Infomaniak a un problème de son côté. Réessaie dans quelques minutes.";
+  if (status === 0) return "Le serveur n'arrive pas à joindre Infomaniak.";
+  return "Infomaniak a refusé la demande.";
+}
+
+// Le test de la page de contrôle coûte quelques millièmes de centime. On le
+// garde une minute en mémoire pour qu'on ne puisse pas le relancer en boucle.
+let dernierTest = null;
+
+async function testerIA() {
+  if (dernierTest && Date.now() - dernierTest.quand < 60 * 1000) return dernierTest.resultat;
+  let resultat;
+  try {
+    const { rep, corps } = await demanderIA({
+      messages: [{ role: "user", content: "Réponds seulement : OK" }],
+      max_tokens: 10,
+      temperature: 0,
+    });
+    if (rep.ok) {
+      nettoyerReponse(rep.donnees, false, corps.model);
+      resultat = { ok: true, modele: corps.model };
+    } else {
+      const detail = JSON.stringify(rep.donnees).slice(0, 300);
+      console.error(`Test de la page /api/modeles refusé par Infomaniak (HTTP ${rep.status}, modèle ${corps.model}) :`, detail);
+      resultat = { ok: false, modele: corps.model, status: rep.status, detail, explication: expliquerErreur(rep.status, detail) };
+    }
+  } catch (e) {
+    resultat = { ok: false, status: 0, detail: e.message, explication: expliquerErreur(0, e.message) };
+  }
+  dernierTest = { quand: Date.now(), resultat };
+  return resultat;
+}
 
 /* ============================================================
    BASE DE DONNÉES (MySQL)
@@ -666,6 +909,76 @@ app.post("/api/textes-loi/recherche", (req, res) => {
 });
 
 /* ============================================================
+   PAGE DE CONTRÔLE — quels modèles sont disponibles ?
+
+   À ouvrir dans Safari : https://tamise-backend.onrender.com/api/modeles
+   Elle affiche le modèle utilisé en ce moment, et la liste exacte des noms
+   à copier-coller dans la variable INFOMANIAK_MODEL de Render. Elle ne
+   montre aucune clé ni aucune donnée personnelle.
+   ============================================================ */
+
+app.get("/api/modeles", async (req, res) => {
+  const echapper = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  let liste = [];
+  let erreur = "";
+  if (!INFOMANIAK_PRODUCT_ID || !INFOMANIAK_API_KEY) {
+    erreur = "INFOMANIAK_PRODUCT_ID ou INFOMANIAK_API_KEY manque dans les variables de Render.";
+  } else {
+    try {
+      liste = await lireModelesInfomaniak();
+      modelesDisponibles = liste;
+    } catch (e) {
+      erreur = "Liste illisible : " + e.message;
+    }
+  }
+  const test = INFOMANIAK_PRODUCT_ID && INFOMANIAK_API_KEY ? await testerIA() : null;
+  const lignes = liste.map((nom) => `
+    <li><code>${echapper(nom)}</code>
+      <button data-nom="${echapper(nom)}" onclick="navigator.clipboard.writeText(this.dataset.nom).then(() => { this.textContent = 'Copié ✓'; })">Copier</button></li>`).join("");
+  res.set("Content-Type", "text/html; charset=utf-8").send(`<!doctype html>
+<html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Modèles d'IA — Tamisé</title>
+<style>
+  body { font-family: -apple-system, system-ui, sans-serif; background: #F7F3EC; color: #3B3631; margin: 0; padding: 20px 16px 40px; line-height: 1.45; }
+  h1 { font-size: 20px; margin: 0 0 14px; }
+  .carte { background: #fff; border-radius: 16px; padding: 14px 16px; margin-bottom: 16px; }
+  .petit { font-size: 13px; color: #7A7068; }
+  ul { list-style: none; padding: 0; margin: 0; }
+  li { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 10px 0; border-bottom: 1px solid #EEE7DD; }
+  li:last-child { border-bottom: none; }
+  code { font-size: 14px; word-break: break-all; }
+  button { flex-shrink: 0; border: none; border-radius: 999px; padding: 8px 14px; background: #7D6E62; color: #fff; font-size: 13px; font-weight: 600; }
+  .erreur { color: #A4483A; }
+  .ok { color: #4F7A4A; font-weight: 600; }
+  p { margin: 6px 0 0; }
+</style></head><body>
+<h1>Modèles d'IA</h1>
+<div class="carte">
+  <div class="petit">L'IA répond-elle ?</div>
+  ${!test
+    ? `<p class="erreur">Test impossible : ${echapper(erreur)}</p>`
+    : test.ok
+      ? `<p class="ok">✓ Oui. Le modèle <code>${echapper(test.modele)}</code> a répondu.</p>`
+      : `<p class="erreur">✗ Non. ${echapper(test.explication)}</p>
+         <p class="petit">Détail technique${test.status ? " (HTTP " + test.status + ")" : ""} : <code>${echapper(test.detail || "")}</code></p>`}
+</div>
+<div class="carte">
+  <div class="petit">Modèle utilisé en ce moment</div>
+  <div><code>${echapper(modeleEffectif || "(aucun)")}</code></div>
+  ${INFOMANIAK_MODEL && modeleEffectif !== INFOMANIAK_MODEL
+    ? (trouverModele(INFOMANIAK_MODEL, liste)
+        ? `<p class="petit">Tu as écrit <code>${echapper(INFOMANIAK_MODEL)}</code> : il est reconnu, mais tu peux recopier le nom exact ci-dessous.</p>`
+        : `<p class="petit erreur">Tu as demandé <code>${echapper(INFOMANIAK_MODEL)}</code> : ce nom n'existe pas chez Infomaniak, un modèle de secours le remplace. Copie un nom exact ci-dessous.</p>`)
+    : ""}
+</div>
+<div class="carte">
+  <div class="petit" style="margin-bottom:6px">Noms exacts disponibles — copie celui que tu veux dans la variable INFOMANIAK_MODEL de Render</div>
+  ${erreur ? `<p class="erreur">${echapper(erreur)}</p>` : `<ul>${lignes}</ul>`}
+</div>
+</body></html>`);
+});
+
+/* ============================================================
    ROUTE — intelligence artificielle (Infomaniak)
    ============================================================ */
 
@@ -677,31 +990,18 @@ app.post("/api/ia", async (req, res) => {
   }
 
   try {
-    // Le modèle défini sur Render prime sur celui envoyé par l'application.
-    const corps = INFOMANIAK_MODEL
-      ? { ...req.body, model: INFOMANIAK_MODEL }
-      : req.body;
+    // Le modèle choisi par le serveur prime sur celui envoyé par l'application.
+    const messages = (req.body && req.body.messages) || [];
+    const demandeJSON = messages.some((m) => m && typeof m.content === "string" && m.content.includes("JSON"));
+    const { rep, corps } = await demanderIA(req.body || {});
 
-    const reponse = await fetch(
-      `https://api.infomaniak.com/2/ai/${INFOMANIAK_PRODUCT_ID}/openai/v1/chat/completions`,
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${INFOMANIAK_API_KEY}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(corps),
-      }
-    );
-
-    const donnees = await reponse.json();
-
-    if (!reponse.ok) {
-      console.error("Erreur Infomaniak :", donnees);
-      return res.status(reponse.status).json(donnees);
+    if (!rep.ok) {
+      console.error(`Erreur Infomaniak (modèle ${corps.model}) :`, JSON.stringify(rep.donnees).slice(0, 600));
+      return res.status(rep.status).json(rep.donnees);
     }
 
-    res.json(donnees);
+    nettoyerReponse(rep.donnees, demandeJSON, corps.model);
+    res.json(rep.donnees);
   } catch (erreur) {
     console.error("Erreur serveur en appelant Infomaniak :", erreur);
     res.status(500).json({ error: "Impossible de joindre l'IA pour le moment." });
@@ -717,4 +1017,6 @@ initBase()
     app.listen(PORT, () => {
       console.log(`Serveur Tamisé démarré sur le port ${PORT}`);
     });
+    // Vérifie le modèle d'IA demandé et note dans les logs ceux qui existent.
+    choisirModele().catch((e) => console.error("Choix du modèle impossible :", e));
   });
