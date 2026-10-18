@@ -1,12 +1,15 @@
 /**
  * Serveur backend de Tamisé — à déployer sur Render.
  *
- * Trois rôles :
+ * Quatre rôles :
  *  1. Garder la clé API Infomaniak en sécurité et relayer les demandes d'IA.
  *  2. Stocker les données partagées d'une relation (messages, agenda, dépenses…)
  *     pour que deux téléphones voient la même chose.
  *  3. Extraire le texte des documents ajoutés (PDF) et retrouver, dans ce
  *     texte, les passages qui répondent à une question posée à Iris.
+ *  4. Servir de boîte aux lettres aux photos de la conversation : elles y
+ *     arrivent chiffrées (illisibles pour le serveur) et sont effacées dès
+ *     que l'autre téléphone les a récupérées.
  *
  * Base de données : MySQL (service managé Infomaniak, hébergé en Suisse).
  *
@@ -420,6 +423,24 @@ async function initBase() {
         REFERENCES relations(id) ON DELETE CASCADE
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
   `);
+
+  // Boîte aux lettres des photos de la conversation (décision 043).
+  // « donnees » est la photo CHIFFRÉE par le téléphone de l'expéditeur, avec
+  // une clé que seuls les deux téléphones connaissent : le serveur ne peut
+  // pas la regarder. La ligne est effacée dès que l'autre téléphone l'a
+  // récupérée, et au plus tard 7 jours après (voir la purge plus bas).
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS boite (
+      id           BIGINT       NOT NULL AUTO_INCREMENT PRIMARY KEY,
+      relation_id  VARCHAR(36)  NOT NULL,
+      photo_id     VARCHAR(64)  NOT NULL,
+      donnees      LONGTEXT     NOT NULL,
+      cree_le      TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE KEY uniq_photo (relation_id, photo_id),
+      CONSTRAINT fk_boite_relation FOREIGN KEY (relation_id)
+        REFERENCES relations(id) ON DELETE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+  `);
   console.log("Base de données prête.");
 
   // Purge des codes jamais utilisés après 7 jours : sans ce nettoyage, un
@@ -433,6 +454,14 @@ async function initBase() {
       if (r.affectedRows) console.log(`${r.affectedRows} code(s) de jumelage expiré(s) purgé(s).`);
     } catch (e) {
       console.error("Purge des codes expirés : échec —", e.message);
+    }
+    // Une photo que l'autre téléphone n'est jamais venu chercher ne reste
+    // pas plus de 7 jours dans la boîte aux lettres.
+    try {
+      const [r] = await pool.query("DELETE FROM boite WHERE cree_le < (NOW() - INTERVAL 7 DAY)");
+      if (r.affectedRows) console.log(`${r.affectedRows} photo(s) jamais récupérée(s) effacée(s) de la boîte aux lettres.`);
+    } catch (e) {
+      console.error("Purge de la boîte aux lettres : échec —", e.message);
     }
   }
   purgerCodesExpires();
@@ -739,6 +768,61 @@ app.delete("/api/relations/:id/documents/:docId", async (req, res) => {
   } catch (e) {
     console.error("Erreur suppression document :", e);
     res.status(500).json({ error: "Suppression impossible." });
+  }
+});
+
+/* ============================================================
+   ROUTES — boîte aux lettres des photos de la conversation (décision 043)
+
+   Le téléphone qui envoie dépose la photo CHIFFRÉE ; celui qui reçoit vient
+   la chercher, la range chez lui, puis demande qu'elle soit effacée. Le
+   serveur ne voit jamais qu'un bloc illisible, et ne le garde pas.
+   ============================================================ */
+
+app.post("/api/relations/:id/boite", async (req, res) => {
+  if (!exigerBase(res)) return;
+  try {
+    const { photoId, donnees } = req.body || {};
+    if (!photoId || typeof donnees !== "string" || !donnees) {
+      return res.status(400).json({ error: "photoId et donnees sont requis." });
+    }
+    // Une photo réduite par l'application pèse quelques centaines de Ko.
+    if (donnees.length > 8 * 1024 * 1024) return res.status(413).json({ error: "Photo trop lourde." });
+    await pool.query(
+      "INSERT INTO boite (relation_id, photo_id, donnees) VALUES (?, ?, ?) " +
+      "ON DUPLICATE KEY UPDATE donnees = VALUES(donnees)",
+      [req.params.id, String(photoId).slice(0, 64), donnees]
+    );
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("Erreur dépôt de photo :", e.message);
+    res.status(500).json({ error: "Dépôt impossible." });
+  }
+});
+
+app.get("/api/relations/:id/boite/:photoId", async (req, res) => {
+  if (!exigerBase(res)) return;
+  try {
+    const [lignes] = await pool.query(
+      "SELECT donnees FROM boite WHERE relation_id = ? AND photo_id = ?",
+      [req.params.id, req.params.photoId]
+    );
+    if (!lignes.length) return res.status(404).json({ error: "Photo absente : déjà récupérée, ou plus de 7 jours." });
+    res.json({ donnees: lignes[0].donnees });
+  } catch (e) {
+    console.error("Erreur lecture de photo :", e.message);
+    res.status(500).json({ error: "Lecture impossible." });
+  }
+});
+
+app.delete("/api/relations/:id/boite/:photoId", async (req, res) => {
+  if (!exigerBase(res)) return;
+  try {
+    await pool.query("DELETE FROM boite WHERE relation_id = ? AND photo_id = ?", [req.params.id, req.params.photoId]);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("Erreur effacement de photo :", e.message);
+    res.status(500).json({ error: "Effacement impossible." });
   }
 });
 
