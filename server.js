@@ -79,10 +79,21 @@ let modelesDisponibles = null;            // liste lue chez Infomaniak
 let modeleEffectif = INFOMANIAK_MODEL || null;
 
 async function lireModelesInfomaniak() {
-  const r = await fetch(`${INFOMANIAK_BASE}/2/ai/${INFOMANIAK_PRODUCT_ID}/openai/v1/models`, {
-    headers: { Authorization: `Bearer ${INFOMANIAK_API_KEY}` },
-  });
-  const d = await r.json().catch(() => null);
+  // 10 secondes au plus : sans limite, un Infomaniak bloqué faisait attendre
+  // indéfiniment la demande en cours.
+  const ctrl = new AbortController();
+  const minuteur = setTimeout(() => ctrl.abort(), 10000);
+  let r;
+  let d;
+  try {
+    r = await fetch(`${INFOMANIAK_BASE}/2/ai/${INFOMANIAK_PRODUCT_ID}/openai/v1/models`, {
+      headers: { Authorization: `Bearer ${INFOMANIAK_API_KEY}` },
+      signal: ctrl.signal,
+    });
+    d = await r.json().catch(() => null);
+  } finally {
+    clearTimeout(minuteur);
+  }
   if (!r.ok || !d) throw new Error("HTTP " + r.status + " " + JSON.stringify(d).slice(0, 300));
   const liste = Array.isArray(d.data) ? d.data : Array.isArray(d.models) ? d.models : Array.isArray(d) ? d : [];
   return liste.map((m) => (typeof m === "string" ? m : m && (m.id || m.name || m.model))).filter(Boolean);
@@ -128,14 +139,21 @@ async function choisirModele() {
   console.log("Modèle utilisé :", modeleEffectif || "(aucun)");
 }
 
-/** Réglages propres à certains modèles. */
-function reglagesPourModele(modele) {
+/** Réglages propres à certains modèles. Chacun est abandonné, pour ce
+ *  modèle seulement, si Infomaniak le refuse (voir demanderIA). */
+function reglagesPourModele(modele, json) {
   const m = String(modele || "").toLowerCase();
+  const accepte = (nom) => !parametresRefuses.has(modele + "|" + nom);
+  const r = {};
   // Qwen « réfléchit à voix haute » par défaut avant de répondre : c'est plus
   // lent, plus cher, et la vraie réponse peut arriver coupée. On le désactive.
-  if (m.includes("qwen")) return { chat_template_kwargs: { enable_thinking: false } };
-  if (m.includes("mistral-small-4")) return { reasoning_effort: "none" };
-  return {};
+  if (m.includes("qwen") && accepte("chat_template_kwargs")) r.chat_template_kwargs = { enable_thinking: false };
+  if (m.includes("mistral-small-4") && accepte("reasoning_effort")) r.reasoning_effort = "none";
+  // Quand l'app attend du JSON, on demande au modèle de n'écrire QUE du JSON
+  // valide : une seule virgule de travers suffisait à faire échouer l'envoi.
+  // Placé en dernier : c'est le premier retiré si Infomaniak ne le connaît pas.
+  if (json && accepte("response_format")) r.response_format = { type: "json_object" };
+  return r;
 }
 
 // Modèles capables de réfléchir avant de répondre. Si le réglage ci-dessus
@@ -148,7 +166,48 @@ function estJSON(texte) {
 }
 
 let reflexionSignalee = false;
-const reglagesRefuses = new Set();       // modèles pour lesquels Infomaniak refuse nos réglages
+const parametresRefuses = new Set();     // « modèle|réglage » refusés par Infomaniak
+const margeReflexion = new Map();        // modèle → place supplémentaire laissée à la réflexion
+
+// Le mode JSON strict a raté là où la même demande, sans lui, a réussi :
+// au deuxième coup, on le désactive pour ce modèle. On revient alors au
+// fonctionnement d'octobre, où l'app répare elle-même les petits défauts.
+const ratesModeJSON = new Map();
+function signalerRateModeJSON(modele) {
+  const n = (ratesModeJSON.get(modele) || 0) + 1;
+  ratesModeJSON.set(modele, n);
+  if (n >= 2 && !parametresRefuses.has(modele + "|response_format")) {
+    parametresRefuses.add(modele + "|response_format");
+    noterIncident("reglage", `Le mode JSON strict a raté deux fois avec ${modele}, alors que la même demande sans lui a marché : il est désactivé pour ce modèle.`);
+  }
+}
+
+/* ------------------------------------------------------------
+   Journal des incidents (visible sur la page /api/modeles)
+
+   Avant, un échec de l'IA ne laissait de trace que dans les logs de Render,
+   difficiles à lire : on ne savait pas POURQUOI l'app affichait « Le filtre
+   ne répond pas ». Le serveur garde maintenant les 30 derniers incidents,
+   avec l'heure et la raison en clair, et compte les réussites.
+   ------------------------------------------------------------ */
+const DEMARRE_LE = new Date();
+const stats = { appels: 0, reussis: 0, apresNouvelEssai: 0, echecs: 0, reflexions: 0 };
+const incidents = [];
+function noterIncident(type, detail) {
+  incidents.unshift({ quand: new Date(), type, detail: String(detail || "").slice(0, 240) });
+  if (incidents.length > 30) incidents.length = 30;
+  console.error(`[incident ${type}]`, detail);
+}
+// Filet de sécurité : une promesse en erreur que personne n'attend faisait
+// tomber tout le serveur — et pendant qu'il redémarre, l'app ne peut plus
+// joindre le filtre. On la note dans le journal, et on continue.
+process.on("unhandledRejection", (e) => {
+  noterIncident("serveur", "Erreur non rattrapée : " + ((e && e.message) || e));
+});
+const attendre = (ms) => new Promise((r) => setTimeout(r, ms));
+const choixDe = (donnees) => (donnees && Array.isArray(donnees.choices) ? donnees.choices[0] : null);
+const contenuDe = (donnees) => { const c = choixDe(donnees); return c && c.message && typeof c.message.content === "string" ? c.message.content : ""; };
+const resumeErreur = (rep) => (rep.status ? "HTTP " + rep.status + " — " : "") + JSON.stringify(rep.donnees || "").slice(0, 160);
 
 /** Rend une réponse propre à l'app : sans réflexion à voix haute et, quand
  *  l'app a demandé du JSON, avec le JSON seul — un mot de trop avant ou après
@@ -189,20 +248,43 @@ function nettoyerReponse(donnees, demandeJSON, modele) {
   choix.message.content = texte;
   delete choix.message.reasoning_content; // inutile au téléphone, et lourd
   delete choix.message.reasoning;
-  if (reflechi && !reflexionSignalee) {
-    reflexionSignalee = true;
-    console.warn(`Le modèle ${modele} réfléchit avant de répondre malgré le réglage : réponses plus lentes et plus chères.`);
+  if (reflechi) {
+    stats.reflexions++;
+    // Le réglage n'est pas pris en compte : on lui laisse plus de place, pour
+    // que la vraie réponse ne soit pas coupée après la réflexion.
+    margeReflexion.set(modele, 4000);
+    if (!reflexionSignalee) {
+      reflexionSignalee = true;
+      noterIncident("reflexion", `Le modèle ${modele} réfléchit avant de répondre malgré le réglage : réponses plus lentes et plus chères.`);
+    }
   }
 }
 
-async function appelInfomaniak(corps) {
-  const r = await fetch(`${INFOMANIAK_BASE}/2/ai/${INFOMANIAK_PRODUCT_ID}/openai/v1/chat/completions`, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${INFOMANIAK_API_KEY}`, "Content-Type": "application/json" },
-    body: JSON.stringify(corps),
-  });
-  const donnees = await r.json().catch(() => ({ error: "Réponse illisible d'Infomaniak (HTTP " + r.status + ")" }));
-  return { ok: r.ok, status: r.status, donnees };
+/** Un appel à Infomaniak. Ne lève jamais d'erreur : une panne réseau ou un
+ *  délai dépassé reviennent avec status 0. Sans délai maximum, un appel
+ *  bloqué laissait le téléphone attendre indéfiniment. */
+// Temps maximum pour répondre à UNE demande de l'app, nouveaux essais
+// compris (modifiable pour les tests seulement). Le téléphone attend 50
+// secondes : le serveur doit toujours répondre avant qu'il n'abandonne.
+const DELAI_IA_MS = Number(process.env.INFOMANIAK_DELAI_MS) || 45000;
+async function appelInfomaniak(corps, delaiMs = DELAI_IA_MS) {
+  const ctrl = new AbortController();
+  const minuteur = setTimeout(() => ctrl.abort(), delaiMs);
+  try {
+    const r = await fetch(`${INFOMANIAK_BASE}/2/ai/${INFOMANIAK_PRODUCT_ID}/openai/v1/chat/completions`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${INFOMANIAK_API_KEY}`, "Content-Type": "application/json" },
+      body: JSON.stringify(corps),
+      signal: ctrl.signal,
+    });
+    const donnees = await r.json().catch(() => ({ error: "Réponse illisible d'Infomaniak (HTTP " + r.status + ")" }));
+    return { ok: r.ok, status: r.status, donnees };
+  } catch (e) {
+    const tropLent = e && e.name === "AbortError";
+    return { ok: false, status: 0, tropLent, donnees: { error: tropLent ? "Infomaniak n'a pas répondu dans les " + Math.round(delaiMs / 1000) + " secondes." : "Infomaniak injoignable : " + (e && e.message) } };
+  } finally {
+    clearTimeout(minuteur);
+  }
 }
 
 function modeleInconnu(rep) {
@@ -216,19 +298,30 @@ function modeleInconnu(rep) {
  *    ne le renvoie plus jamais pour ce modèle.
  *  - Si le modèle est inconnu (mal écrit, ou retiré entre-temps), relit la
  *    liste et réessaie une fois avec le bon nom ou un modèle de secours. */
-async function demanderIA(demande) {
+async function demanderIA(demande, options = {}) {
+  // « sansModeJSON » : la consigne demande toujours du JSON, mais sans le
+  // mode strict d'Infomaniak (voir le second essai dans /api/ia).
+  const json = Boolean(options.json) && !options.sansModeJSON;
+  // Chaque appel n'a droit qu'au temps qui reste sur la demande entière.
+  const limite = options.limite || Date.now() + DELAI_IA_MS;
+  const reste = () => limite - Date.now();
+  const appel = (c) => appelInfomaniak(c, Math.max(2000, reste()));
   const essayer = async (nom) => {
-    const reglages = reglagesRefuses.has(nom) ? {} : reglagesPourModele(nom);
+    const reglages = reglagesPourModele(nom, json);
     let corps = { ...demande, model: nom, ...reglages };
-    if (PEUT_REFLECHIR.test(nom) && corps.max_tokens) corps.max_tokens = corps.max_tokens + 1500;
-    let rep = await appelInfomaniak(corps);
-    if (!rep.ok && Object.keys(reglages).length && (rep.status === 400 || rep.status === 422)) {
+    if (PEUT_REFLECHIR.test(nom) && corps.max_tokens) corps.max_tokens = corps.max_tokens + (margeReflexion.get(nom) || 1500);
+    let rep = await appel(corps);
+    // Infomaniak refuse un réglage qu'il ne connaît pas : on les retire un par
+    // un (le dernier ajouté d'abord), et on retient celui qui posait problème.
+    const restants = Object.keys(reglages);
+    while (!rep.ok && (rep.status === 400 || rep.status === 422) && restants.length && !modeleInconnu(rep)) {
+      const retire = restants.pop();
       const sans = { ...corps };
-      Object.keys(reglages).forEach((k) => delete sans[k]);
-      const rep2 = await appelInfomaniak(sans);
+      delete sans[retire];
+      const rep2 = await appel(sans);
       if (rep2.ok) {
-        reglagesRefuses.add(nom);
-        console.error(`Infomaniak refuse le réglage ${Object.keys(reglages).join(", ")} pour ${nom} : envoyé sans désormais.`, JSON.stringify(rep.donnees).slice(0, 300));
+        parametresRefuses.add(nom + "|" + retire);
+        noterIncident("reglage", `Infomaniak refuse le réglage « ${retire} » pour ${nom} : il sera envoyé sans désormais. ${resumeErreur(rep)}`);
       }
       rep = rep2;
       corps = sans;
@@ -239,11 +332,25 @@ async function demanderIA(demande) {
   const modele = modeleEffectif || demande.model;
   let { rep, corps } = await essayer(modele);
   if (!rep.ok && modeleInconnu(rep)) {
-    console.error(`Modèle « ${modele} » refusé par Infomaniak :`, JSON.stringify(rep.donnees).slice(0, 400));
+    noterIncident("modele", `Modèle « ${modele} » refusé par Infomaniak. ${resumeErreur(rep)}`);
     await choisirModele();
     if (modeleEffectif && modeleEffectif !== modele) {
       ({ rep, corps } = await essayer(modeleEffectif));
     }
+  }
+  // Erreur passagère (trop de demandes, Infomaniak en difficulté, coupure
+  // réseau) : on réessaie une fois, après une courte pause, sans que la
+  // personne ait à le faire elle-même. Pas après un délai dépassé : le
+  // téléphone a déjà attendu longtemps, il réessaiera de son côté.
+  const passagere = !rep.ok && ((rep.status === 0 && !rep.tropLent) || rep.status === 429 || (rep.status >= 500 && rep.status <= 504));
+  const pause = rep.status === 429 ? 2500 : 1200;
+  // Seulement s'il reste assez de temps pour qu'un nouvel essai ait une
+  // chance d'aboutir ; sinon, c'est le téléphone qui réessaiera.
+  if (passagere && reste() > pause + 8000) {
+    noterIncident("infomaniak", "Erreur passagère d'Infomaniak, nouvel essai : " + resumeErreur(rep));
+    await attendre(pause);
+    ({ rep, corps } = await essayer(modeleEffectif || modele));
+    if (rep.ok) stats.apresNouvelEssai++;
   }
   return { rep, corps };
 }
@@ -1016,6 +1123,13 @@ app.get("/api/modeles", async (req, res) => {
     }
   }
   const test = INFOMANIAK_PRODUCT_ID && INFOMANIAK_API_KEY ? await testerIA() : null;
+  const heure = (d) => d.toLocaleString("fr-FR", { timeZone: "Europe/Paris", day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" });
+  const minutesDepuis = Math.round((Date.now() - DEMARRE_LE.getTime()) / 60000);
+  const depuisTxt = minutesDepuis < 60 ? minutesDepuis + " min" : minutesDepuis < 2880 ? Math.round(minutesDepuis / 60) + " h" : Math.round(minutesDepuis / 1440) + " jours";
+  const NOMS_INCIDENTS = { infomaniak: "Infomaniak a refusé ou n'a pas répondu", lenteur: "Infomaniak trop lent", json: "Réponse illisible", coupee: "Réponse coupée", reglage: "Réglage refusé", modele: "Modèle introuvable", reflexion: "Réflexion à voix haute", serveur: "Erreur du serveur" };
+  const lignesIncidents = incidents.slice(0, 12).map((i) => `
+    <li style="display:block"><div class="petit">${heure(i.quand)} · <b>${echapper(NOMS_INCIDENTS[i.type] || i.type)}</b></div>
+      <div style="font-size:12.5px;word-break:break-word">${echapper(i.detail)}</div></li>`).join("");
   const lignes = liste.map((nom) => `
     <li><code>${echapper(nom)}</code>
       <button data-nom="${echapper(nom)}" onclick="navigator.clipboard.writeText(this.dataset.nom).then(() => { this.textContent = 'Copié ✓'; })">Copier</button></li>`).join("");
@@ -1047,6 +1161,12 @@ app.get("/api/modeles", async (req, res) => {
          <p class="petit">Détail technique${test.status ? " (HTTP " + test.status + ")" : ""} : <code>${echapper(test.detail || "")}</code></p>`}
 </div>
 <div class="carte">
+  <div class="petit">Fiabilité depuis le démarrage du serveur (${heure(DEMARRE_LE)}, il y a ${depuisTxt})</div>
+  <p>${stats.appels} demande(s) · <b>${stats.reussis}</b> réussie(s)${stats.apresNouvelEssai ? ", dont " + stats.apresNouvelEssai + " après un nouvel essai automatique" : ""} · <b>${stats.echecs}</b> échec(s)</p>
+  <p class="petit">Si l'heure de démarrage change souvent, c'est que le serveur s'endort quand personne ne s'en sert : le premier message après une pause est alors plus lent.</p>
+  ${incidents.length ? `<div class="petit" style="margin-top:10px">Derniers incidents</div><ul>${lignesIncidents}</ul>` : `<p class="petit">Aucun incident depuis le démarrage.</p>`}
+</div>
+<div class="carte">
   <div class="petit">Modèle utilisé en ce moment</div>
   <div><code>${echapper(modeleEffectif || "(aucun)")}</code></div>
   ${INFOMANIAK_MODEL && modeleEffectif !== INFOMANIAK_MODEL
@@ -1073,21 +1193,64 @@ app.post("/api/ia", async (req, res) => {
     });
   }
 
+  stats.appels++;
   try {
     // Le modèle choisi par le serveur prime sur celui envoyé par l'application.
     const messages = (req.body && req.body.messages) || [];
     const demandeJSON = messages.some((m) => m && typeof m.content === "string" && m.content.includes("JSON"));
-    const { rep, corps } = await demanderIA(req.body || {});
+    const limite = Date.now() + DELAI_IA_MS;
+    let { rep, corps } = await demanderIA(req.body || {}, { json: demandeJSON, limite });
 
     if (!rep.ok) {
-      console.error(`Erreur Infomaniak (modèle ${corps.model}) :`, JSON.stringify(rep.donnees).slice(0, 600));
-      return res.status(rep.status).json(rep.donnees);
+      stats.echecs++;
+      noterIncident(rep.tropLent ? "lenteur" : "infomaniak", `Échec (modèle ${corps.model}) : ${resumeErreur(rep)}`);
+      return res.status(rep.status || 502).json(rep.donnees);
     }
 
     nettoyerReponse(rep.donnees, demandeJSON, corps.model);
+
+    // L'app attend du JSON : on vérifie AVANT de répondre. Une réponse
+    // illisible ou coupée est redemandée une fois, ici, avec plus de place si
+    // elle était coupée — au lieu d'afficher « Le filtre ne répond pas ».
+    if (demandeJSON && !estJSON(contenuDe(rep.donnees))) {
+      const choix = choixDe(rep.donnees);
+      const coupee = choix && choix.finish_reason === "length";
+      const avecModeJSON = Boolean(corps.response_format);
+      noterIncident(coupee ? "coupee" : "json",
+        (coupee ? "Réponse coupée avant la fin" : "Réponse qui n'est pas du JSON") + " (modèle " + corps.model + ") : « " + contenuDe(rep.donnees).slice(0, 120) + " »");
+      let aRenvoyer = rep.donnees;
+      if (limite - Date.now() > 8000) {
+        const nouvelle = { ...(req.body || {}) };
+        if (coupee && nouvelle.max_tokens) nouvelle.max_tokens = nouvelle.max_tokens * 2;
+        // Second essai SANS le mode JSON strict : si c'est lui qui a dérapé
+        // (certains modèles écrivent alors des espaces à l'infini, jusqu'à la
+        // coupure), changer de méthode réussit là où insister échouerait.
+        // Le modèle écrit quand même du JSON : la consigne le lui demande.
+        const second = await demanderIA(nouvelle, { json: true, sansModeJSON: true, limite });
+        if (second.rep.ok) {
+          nettoyerReponse(second.rep.donnees, true, second.corps.model);
+          if (estJSON(contenuDe(second.rep.donnees))) {
+            if (avecModeJSON) signalerRateModeJSON(corps.model);
+            stats.reussis++;
+            stats.apresNouvelEssai++;
+            return res.json(second.rep.donnees);
+          }
+          // Presque lisible (un retour à la ligne de travers…) : l'app sait
+          // réparer ce genre de petit défaut, mieux vaut lui donner celle-ci.
+          if (contenuDe(second.rep.donnees).trim()) aRenvoyer = second.rep.donnees;
+        }
+      }
+      // Toujours illisible : l'app essaiera de la réparer, sinon elle
+      // redemandera de son côté.
+      stats.echecs++;
+      return res.json(aRenvoyer);
+    }
+
+    stats.reussis++;
     res.json(rep.donnees);
   } catch (erreur) {
-    console.error("Erreur serveur en appelant Infomaniak :", erreur);
+    stats.echecs++;
+    noterIncident("serveur", "Erreur du serveur en appelant Infomaniak : " + (erreur && erreur.message));
     res.status(500).json({ error: "Impossible de joindre l'IA pour le moment." });
   }
 });
